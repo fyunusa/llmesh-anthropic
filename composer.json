@@ -1,0 +1,32 @@
+{
+  "name": "llmesh/anthropic",
+  "description": "Anthropic provider for LLMesh AI library",
+  "type": "library",
+  "license": "MIT",
+  "repositories": [
+    {
+      "type": "path",
+      "url": "../llmesh"
+    }
+  ],
+  "require": {
+    "php": "^8.1",
+    "llmesh/core": "@dev"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^12.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "LLMesh\\Anthropic\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "LLMesh\\Anthropic\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
+  }
+}
