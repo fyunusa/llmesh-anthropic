@@ -10,12 +10,12 @@ use LLMesh\Core\Contracts\ResponseInterface;
 use LLMesh\Core\Contracts\StreamInterface;
 use LLMesh\Core\Data\ChunkDelta;
 use LLMesh\Core\Data\ToolCall;
+use LLMesh\Core\Data\ProviderChatResponse;
+use LLMesh\Core\Data\ProviderStream;
 use LLMesh\Core\Exceptions\HttpException;
 use LLMesh\Core\Exceptions\ProviderException;
 use LLMesh\Core\Exceptions\RateLimitException;
 use LLMesh\Core\Exceptions\TokenLimitException;
-use LLMesh\Core\Generators\StreamResponse;
-use LLMesh\Core\Generators\TextResponse;
 use LLMesh\Core\Http\HttpClient;
 use LLMesh\Core\Http\HttpClientFactory;
 
@@ -23,23 +23,13 @@ use LLMesh\Core\Http\HttpClientFactory;
  * Anthropic provider implementing ProviderInterface.
  *
  * Supports Claude models via the Anthropic Messages API.
- *
- * Key differences from OpenAI:
- *   - Auth uses `x-api-key` header, NOT `Authorization: Bearer`
- *   - `anthropic-version` header is required on every request
- *   - System prompt is a top-level API field, not a member of the messages array
- *   - Messages must strictly alternate user/assistant (validated by MessageMapper)
- *   - Tool definitions use `input_schema` instead of `parameters`
- *   - Tool-use responses are content blocks of type `tool_use` with `id`, `name`, `input`
- *   - Tool result messages use role=user with content type `tool_result` + `tool_use_id`
- *   - Streaming events are `content_block_delta` with delta type `text_delta` or `input_json_delta`
- *   - Stop reasons: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`
- *   - Embeddings are NOT supported; `embed()` throws BadMethodCallException
  */
 final class AnthropicProvider implements ProviderInterface
 {
     private const API_BASE = 'https://api.anthropic.com/v1';
     private const MESSAGES_ENDPOINT = self::API_BASE . '/messages';
+
+    private array $currentToolCalls = [];
 
     /**
      * @param string          $apiKey     Anthropic API key (sent via x-api-key header)
@@ -74,7 +64,14 @@ final class AnthropicProvider implements ProviderInterface
                 $this->getHeaders(),
             );
 
-            return TextResponse::fromProviderResponse($raw, fn (array $r) => $this->parseChatResponse($r));
+            $parsed = $this->parseChatResponse($raw);
+            return new ProviderChatResponse(
+                text: $parsed['text'],
+                inputTokens: $parsed['usage']['input_tokens'],
+                outputTokens: $parsed['usage']['output_tokens'],
+                finishReason: $parsed['finishReason'],
+                raw: $raw
+            );
         } catch (HttpException $e) {
             $this->handleHttpException($e);
         }
@@ -84,16 +81,13 @@ final class AnthropicProvider implements ProviderInterface
      * {@inheritdoc}
      *
      * Yields ChunkDelta objects from Anthropic Server-Sent Events.
-     * Recognised event types:
-     *   - content_block_delta / text_delta      → ChunkDelta::text()
-     *   - content_block_delta / input_json_delta → tool argument accumulation (null chunk)
-     *   - message_delta (stop_reason present)    → ChunkDelta::finish()
-     *   - message_stop                           → stream end sentinel (no chunk emitted)
      */
     public function stream(array $messages, array $options = []): StreamInterface
     {
         $mapped  = MessageMapper::map($messages);
         $payload = $this->buildPayload($mapped, $options, stream: true);
+
+        $this->currentToolCalls = [];
 
         $generator = (function () use ($payload): \Generator {
             try {
@@ -111,7 +105,7 @@ final class AnthropicProvider implements ProviderInterface
 
                     $json = substr($line, 6);
 
-                    // [DONE] sentinel (Anthropic sends message_stop event instead, but guard anyway)
+                    // [DONE] sentinel
                     if ($json === '[DONE]') {
                         break;
                     }
@@ -131,7 +125,7 @@ final class AnthropicProvider implements ProviderInterface
             }
         })();
 
-        return new StreamResponse($generator);
+        return new ProviderStream($generator);
     }
 
     /**
@@ -211,6 +205,19 @@ final class AnthropicProvider implements ProviderInterface
     // -------------------------------------------------------------------------
 
     /**
+     * Map Anthropic stop reasons to canonical values.
+     */
+    private function mapStopReason(?string $reason): string
+    {
+        return match ($reason) {
+            'end_turn', 'stop_sequence' => 'stop',
+            'max_tokens' => 'length',
+            'tool_use' => 'tool_calls',
+            default => $reason ?? 'stop',
+        };
+    }
+
+    /**
      * Parse an Anthropic chat completion response.
      *
      * Content blocks may be of type 'text' or 'tool_use'. Text blocks are
@@ -239,17 +246,12 @@ final class AnthropicProvider implements ProviderInterface
                 'input_tokens'  => $raw['usage']['input_tokens'] ?? 0,
                 'output_tokens' => $raw['usage']['output_tokens'] ?? 0,
             ],
-            'finishReason' => $finishReason,
+            'finishReason' => $this->mapStopReason($finishReason),
         ];
     }
 
     /**
      * Parse a single Anthropic SSE event into a ChunkDelta (or null to skip).
-     *
-     * Anthropic SSE event types of interest:
-     *   - content_block_delta: carries text_delta or input_json_delta
-     *   - message_delta:       carries stop_reason when generation ends
-     *   - message_stop:        final sentinel; no data to emit
      *
      * @param  array<string, mixed> $event Decoded SSE event payload
      * @return ChunkDelta|null
@@ -257,6 +259,19 @@ final class AnthropicProvider implements ProviderInterface
     private function parseStreamEvent(array $event): ?ChunkDelta
     {
         $type = $event['type'] ?? null;
+
+        if ($type === 'content_block_start') {
+            $block = $event['content_block'] ?? [];
+            if (($block['type'] ?? '') === 'tool_use') {
+                $index = $event['index'] ?? 0;
+                $this->currentToolCalls[$index] = [
+                    'id' => $block['id'] ?? '',
+                    'name' => $block['name'] ?? '',
+                    'input' => ''
+                ];
+            }
+            return null;
+        }
 
         if ($type === 'content_block_delta') {
             $delta     = $event['delta'] ?? [];
@@ -266,36 +281,47 @@ final class AnthropicProvider implements ProviderInterface
                 return ChunkDelta::text($delta['text'] ?? '');
             }
 
-            // input_json_delta accumulates tool-call arguments; we skip mid-stream
-            // — a complete ToolCall DTO is only possible after the full block is assembled.
+            if ($deltaType === 'input_json_delta') {
+                $index = $event['index'] ?? 0;
+                if (isset($this->currentToolCalls[$index])) {
+                    $this->currentToolCalls[$index]['input'] .= $delta['partial_json'] ?? '';
+                }
+            }
             return null;
         }
 
         if ($type === 'content_block_stop') {
-            // Signals the end of a content block (tool_use or text).
-            // The provider emits a message_delta with stop_reason shortly after.
+            $index = $event['index'] ?? 0;
+            if (isset($this->currentToolCalls[$index])) {
+                $toolCallData = $this->currentToolCalls[$index];
+                unset($this->currentToolCalls[$index]);
+
+                $args = json_decode($toolCallData['input'], true) ?? [];
+                
+                $toolCall = new ToolCall(
+                    id:        $toolCallData['id'],
+                    name:      $toolCallData['name'],
+                    arguments: $args,
+                );
+
+                return ChunkDelta::toolCall($toolCall);
+            }
             return null;
         }
 
         if ($type === 'message_delta') {
             $stopReason = $event['delta']['stop_reason'] ?? null;
             if ($stopReason !== null) {
-                return ChunkDelta::finish($stopReason);
+                return ChunkDelta::finish($this->mapStopReason($stopReason));
             }
             return null;
         }
 
-        // message_stop, ping, content_block_start, message_start → ignore
         return null;
     }
 
     /**
      * Parse a completed tool_use content block into a ToolCall DTO.
-     *
-     * The Anthropic API returns tool_use blocks with:
-     *   - id:    unique identifier (matches tool_use_id in subsequent tool_result)
-     *   - name:  tool function name
-     *   - input: decoded arguments object (already associative array)
      *
      * @param  array<string, mixed> $block A content block with type='tool_use'
      * @return ToolCall
@@ -315,9 +341,6 @@ final class AnthropicProvider implements ProviderInterface
 
     /**
      * Build the required Anthropic API request headers.
-     *
-     * Authentication uses `x-api-key` (NOT `Authorization: Bearer`).
-     * The `anthropic-version` header is mandatory.
      *
      * @return array<string, string>
      */

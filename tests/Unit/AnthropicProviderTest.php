@@ -203,7 +203,7 @@ final class AnthropicProviderTest extends TestCase
         $response = $this->provider->chat([Message::user('What is the answer?')]);
 
         self::assertSame('The answer is 42.', $response->getText());
-        self::assertSame('end_turn', $response->getFinishReason());
+        self::assertSame('stop', $response->getFinishReason());
         self::assertSame(15, $response->getUsage()->getInputTokens());
         self::assertSame(8,  $response->getUsage()->getOutputTokens());
     }
@@ -230,7 +230,7 @@ final class AnthropicProviderTest extends TestCase
 
         $response = $this->provider->chat([Message::user('Weather in London?')]);
 
-        self::assertSame('tool_use', $response->getFinishReason());
+        self::assertSame('tool_calls', $response->getFinishReason());
     }
 
     // -------------------------------------------------------------------------
@@ -315,7 +315,7 @@ final class AnthropicProviderTest extends TestCase
         $finishChunks = array_filter($chunks, fn ($c) => $c->finishReason !== null);
         $finishChunks = array_values($finishChunks);
         self::assertCount(1, $finishChunks);
-        self::assertSame('end_turn', $finishChunks[0]->finishReason);
+        self::assertSame('stop', $finishChunks[0]->finishReason);
     }
 
     public function testStreamSkipsInputJsonDeltaEvents(): void
@@ -447,5 +447,71 @@ final class AnthropicProviderTest extends TestCase
                 'output_tokens' => 8,
             ],
         ];
+    }
+
+    public function testStreamAccumulatesInputJsonDeltaAndEmitsToolCallOnStop(): void
+    {
+        $sseLines = [
+            'data: ' . json_encode([
+                'type' => 'content_block_start',
+                'index' => 1,
+                'content_block' => [
+                    'type' => 'tool_use',
+                    'id' => 'toolu_abc_123',
+                    'name' => 'get_weather',
+                    'input' => new \stdClass()
+                ]
+            ]),
+            'data: ' . json_encode([
+                'type' => 'content_block_delta',
+                'index' => 1,
+                'delta' => [
+                    'type' => 'input_json_delta',
+                    'partial_json' => '{"ci'
+                ]
+            ]),
+            'data: ' . json_encode([
+                'type' => 'content_block_delta',
+                'index' => 1,
+                'delta' => [
+                    'type' => 'input_json_delta',
+                    'partial_json' => 'ty": "London"}'
+                ]
+            ]),
+            'data: ' . json_encode([
+                'type' => 'content_block_stop',
+                'index' => 1
+            ]),
+            'data: ' . json_encode([
+                'type' => 'message_delta',
+                'delta' => [
+                    'stop_reason' => 'tool_use'
+                ]
+            ])
+        ];
+
+        $this->mockHttpClient
+            ->method('stream')
+            ->willReturn((static function () use ($sseLines): \Generator {
+                yield from $sseLines;
+            })());
+
+        $stream = $this->provider->stream([Message::user('Weather in London?')]);
+        $chunks = [];
+        foreach ($stream as $chunk) {
+            $chunks[] = $chunk;
+        }
+
+        $toolChunks = array_filter($chunks, fn ($c) => $c->toolCall !== null);
+        $toolChunks = array_values($toolChunks);
+        self::assertCount(1, $toolChunks);
+        self::assertSame('toolu_abc_123', $toolChunks[0]->toolCall->id);
+        self::assertSame('get_weather', $toolChunks[0]->toolCall->name);
+        self::assertSame(['city' => 'London'], $toolChunks[0]->toolCall->arguments);
+
+        $finishChunks = array_filter($chunks, fn ($c) => $c->finishReason !== null);
+        $finishChunks = array_values($finishChunks);
+        self::assertCount(1, $finishChunks);
+        self::assertSame('tool_calls', $finishChunks[0]->finishReason);
     }
 }
