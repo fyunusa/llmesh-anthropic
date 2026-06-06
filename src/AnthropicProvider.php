@@ -143,6 +143,20 @@ final class AnthropicProvider implements ProviderInterface
     }
 
     /**
+     * Anthropic does not provide an embedding API.
+     *
+     * {@inheritdoc}
+     *
+     * @throws \BadMethodCallException Always.
+     */
+    public function embedBatch(array $inputs, array $options = []): array
+    {
+        throw new \BadMethodCallException(
+            'Anthropic does not support embeddings. Use a dedicated embedding provider instead.'
+        );
+    }
+
+    /**
      * {@inheritdoc}
      *
      * Supported capabilities: 'streaming', 'tools'.
