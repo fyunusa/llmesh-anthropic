@@ -104,6 +104,10 @@ final class MessageMapper
                 );
             }
 
+            if (isset($toolArray['type']) && $toolArray['type'] === 'function' && isset($toolArray['function'])) {
+                $toolArray = $toolArray['function'];
+            }
+
             return [
                 'name'         => $toolArray['name'],
                 'description'  => $toolArray['description'] ?? '',
@@ -140,6 +144,32 @@ final class MessageMapper
                     ],
                 ],
             ];
+        }
+
+        if ($message->role === MessageRole::ASSISTANT) {
+            $content = $message->content;
+            if (str_starts_with($content, '[')) {
+                try {
+                    $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+                    if (is_array($decoded) && !empty($decoded) && isset($decoded[0]['id'], $decoded[0]['name'])) {
+                        $blocks = [];
+                        foreach ($decoded as $tc) {
+                            $blocks[] = [
+                                'type'  => 'tool_use',
+                                'id'    => $tc['id'],
+                                'name'  => $tc['name'],
+                                'input' => $tc['arguments'] ?? [],
+                            ];
+                        }
+                        return [
+                            'role'    => 'assistant',
+                            'content' => $blocks,
+                        ];
+                    }
+                } catch (\JsonException) {
+                    // Fall back to plain text mapping
+                }
+            }
         }
 
         return [
